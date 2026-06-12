@@ -590,7 +590,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 (async () => {
   // Random delay for scheduled runs (anti-detection)
   if (GITHUB_EVENT_NAME === 'schedule') {
-    const maxDelaySec = 3 * 60 * 60;
+    const maxDelaySec = 1 * 60 * 60;
     const delaySec = Math.floor(Math.random() * maxDelaySec);
     const hours = Math.floor(delaySec / 3600);
     const minutes = Math.floor((delaySec % 3600) / 60);
