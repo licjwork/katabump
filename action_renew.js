@@ -691,15 +691,22 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
                 // --- Cloudflare Turnstile Bypass for Login ---
                 console.log('   >> 正在登录前检查 Turnstile (使用 CDP 绕过)...');
-                let cdpClickResult = false;
-                for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
-                    cdpClickResult = await attemptTurnstileCdp(page);
-                    if (cdpClickResult) break;
-                    await page.waitForTimeout(1000);
-                }
+                let turnstileSolved = false;
+                for (let clickRetry = 0; clickRetry < 3; clickRetry++) {
+                    let cdpClickResult = false;
+                    for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                        cdpClickResult = await attemptTurnstileCdp(page);
+                        if (cdpClickResult) break;
+                        await page.waitForTimeout(1000);
+                    }
 
-                if (cdpClickResult) {
-                    console.log('   >> 登录 CDP 点击生效。正在等待最多 10秒 Cloudflare 成功标志...');
+                    if (!cdpClickResult) {
+                        console.log('   >> 登录前未检测到 Turnstile，可能无需验证。');
+                        turnstileSolved = true;
+                        break;
+                    }
+
+                    console.log(`   >> 登录 CDP 点击已发送 (尝试 ${clickRetry + 1}/3)。等待 Cloudflare 成功标志...`);
                     for (let waitSec = 0; waitSec < 10; waitSec++) {
                         const frames = page.frames();
                         let isSuccess = false;
@@ -715,33 +722,51 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         }
                         if (isSuccess) {
                             console.log('   >> 登录前 Turnstile 验证成功。');
+                            turnstileSolved = true;
                             break;
                         }
                         await page.waitForTimeout(1000);
                     }
-                } else {
-                    console.log('   >> 登录前未检测到或未点击 Turnstile，继续操作...');
+                    if (turnstileSolved) break;
+                    console.log(`   >> Turnstile 点击后未检测到成功，${clickRetry < 2 ? '重试...' : '已达最大重试次数。'}`);
                 }
                 // --------------------------------------------
 
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
 
-                // User Request: Check for incorrect password
+                // Wait for page navigation away from login page, or detect errors
                 try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-        if (await errorMsg.isVisible({ timeout: 3000 })) {
-          console.error(` >> ❌ 登录失败: 用户 ${user.username} 账号或密码错误`);
-          const failPhotoDir = path.join(process.cwd(), 'screenshots');
-          if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-          const failSafeName = user.username.replace(/[^a-z0-9]/gi, '_');
-          const failShotPath = path.join(failPhotoDir, `${failSafeName}_login_fail.png`);
-          try { await page.screenshot({ path: failShotPath, fullPage: true }); } catch (e) { }
+                    await page.waitForURL(url => !url.href.includes('/auth/login'), { timeout: 15000 });
+                    console.log('   >> 登录成功，页面已跳转。');
+                } catch (e) {
+                    console.log('   >> 登录后页面未跳转，检查错误信息...');
+                    let loginFailReason = null;
 
-          await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: 账号或密码错误`, failShotPath);
+                    try {
+                        if (await page.getByText('Incorrect password or no account').isVisible({ timeout: 2000 })) {
+                            loginFailReason = '账号或密码错误';
+                        }
+                    } catch (e2) { }
 
-                        continue;
+                    if (!loginFailReason) {
+                        try {
+                            if (await page.getByText('Please complete the captcha').isVisible({ timeout: 2000 })) {
+                                loginFailReason = 'Turnstile 验证未通过';
+                            }
+                        } catch (e2) { }
                     }
-                } catch (e) { }
+
+                    const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                    const failSafeName = user.username.replace(/[^a-z0-9]/gi, '_');
+                    const failShotPath = path.join(failPhotoDir, `${failSafeName}_login_fail.png`);
+                    try { await page.screenshot({ path: failShotPath, fullPage: true }); } catch (e2) { }
+
+                    if (!loginFailReason) loginFailReason = `未知原因 (当前URL: ${page.url()})`;
+                    console.error(` >> ❌ 登录失败: 用户 ${user.username} ${loginFailReason}`);
+                    await sendTelegramMessage(`❌ *登录失败*\n用户: ${user.username}\n原因: ${loginFailReason}`, failShotPath);
+                    continue;
+                }
 
             } catch (e) {
                 console.log('登录错误:', e.message);
@@ -753,7 +778,12 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.waitForTimeout(1000);
                 await page.getByRole('link', { name: 'See' }).first().click();
             } catch (e) {
-                console.log('未找到 "See" 按钮。');
+                console.log('未找到 "See" 按钮。当前URL:', page.url());
+                const seePhotoDir = path.join(process.cwd(), 'screenshots');
+                if (!fs.existsSync(seePhotoDir)) fs.mkdirSync(seePhotoDir, { recursive: true });
+                const seeSafeName = user.username.replace(/[^a-z0-9]/gi, '_');
+                const seeShotPath = path.join(seePhotoDir, `${seeSafeName}_no_see_link.png`);
+                try { await page.screenshot({ path: seeShotPath, fullPage: true }); } catch (e2) { }
                 continue;
             }
 
