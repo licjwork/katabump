@@ -349,26 +349,43 @@ async function dispatchCdpClick(page, x, y) {
 async function getAltchaStatus(page) {
     try {
         return await page.evaluate(() => {
-            const normalize = (value) => {
-                if (value == null) return '';
-                return String(value).trim();
+            const normalize = (value) => value == null ? '' : String(value).trim();
+
+            const isRendered = (element) => {
+                if (!element) return false;
+                const rect = element.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return false;
+
+                for (let current = element; current; current = current.parentElement) {
+                    const style = getComputedStyle(current);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                }
+                return true;
             };
 
-            const widget = document.querySelector('altcha-widget');
-            const altchaInputs = Array.from(document.querySelectorAll('input[name="altcha"], textarea[name="altcha"], input[name*="altcha" i], textarea[name*="altcha" i]'));
+            // The page contains ALTCHA widgets for multiple forms (including the
+            // hidden Delete form). Only inspect a rendered widget; Renew currently
+            // uses auto="onsubmit" and intentionally hides its ALTCHA UI.
+            const widgets = Array.from(document.querySelectorAll('altcha-widget'));
+            const widget = widgets.find(isRendered) || null;
+            const altchaInputs = widget
+                ? Array.from(widget.closest('form')?.querySelectorAll('input[name="altcha"], textarea[name="altcha"], input[name*="altcha" i], textarea[name*="altcha" i]') || [])
+                : [];
             const firstFilledInput = altchaInputs.find((input) => normalize(input.value).length > 0);
             const shadowRoot = widget ? widget.shadowRoot : null;
-            const checkbox = shadowRoot ? shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]') : null;
+            const checkbox = shadowRoot?.querySelector('input[type="checkbox"], [role="checkbox"]') || null;
+            const visualRoot = widget?.querySelector('.altcha') || null;
 
-            const stateProp = normalize(widget ? widget.state : '');
-            const stateAttr = normalize(widget ? widget.getAttribute('state') : '');
-            const valueProp = normalize(widget ? widget.value : '');
-            const valueAttr = normalize(widget ? widget.getAttribute('value') : '');
-            const hiddenInputValue = normalize(firstFilledInput ? firstFilledInput.value : '');
+            const stateProp = normalize(widget?.state);
+            const stateAttr = normalize(widget?.getAttribute('state'));
+            const dataState = normalize(visualRoot?.getAttribute('data-state'));
+            const valueProp = normalize(widget?.value);
+            const valueAttr = normalize(widget?.getAttribute('value'));
+            const hiddenInputValue = normalize(firstFilledInput?.value);
             const checkboxChecked = checkbox && typeof checkbox.checked === 'boolean' ? checkbox.checked : null;
-            const ariaChecked = normalize(checkbox ? checkbox.getAttribute('aria-checked') : '');
-            const busyAttr = normalize(widget ? widget.getAttribute('aria-busy') : '');
-            const state = stateProp || stateAttr || '';
+            const ariaChecked = normalize(checkbox?.getAttribute('aria-checked'));
+            const busyAttr = normalize(widget?.getAttribute('aria-busy'));
+            const state = stateProp || stateAttr || dataState;
             const isSolved = state === 'verified' || valueProp.length > 0 || valueAttr.length > 0 || hiddenInputValue.length > 0;
             const isVerifying = !isSolved && (
                 state === 'verifying' ||
@@ -380,7 +397,9 @@ async function getAltchaStatus(page) {
             );
 
             return {
-                exists: !!widget || altchaInputs.length > 0,
+                // `exists` means an interactive/rendered ALTCHA is present.
+                // Hidden auto="onsubmit" widgets must not block the Renew flow.
+                exists: !!widget,
                 solved: isSolved,
                 isVerifying,
                 state: state || 'unknown',
@@ -421,7 +440,7 @@ async function checkAltchaSuccess(page) {
 
 async function attemptAltchaClick(page, currentStatus = null) {
     try {
-        const altchaWidget = page.locator('altcha-widget').first();
+        const altchaWidget = page.locator('altcha-widget:visible').first();
         if (await altchaWidget.count() > 0) {
 
             const status = currentStatus || await getAltchaStatus(page);
@@ -435,7 +454,17 @@ async function attemptAltchaClick(page, currentStatus = null) {
             await altchaWidget.scrollIntoViewIfNeeded().catch(() => {});
 
             let boxInfo = await page.evaluate(() => {
-                const widget = document.querySelector('altcha-widget');
+                const isRendered = (element) => {
+                    if (!element) return false;
+                    const rect = element.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    for (let current = element; current; current = current.parentElement) {
+                        const style = getComputedStyle(current);
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    }
+                    return true;
+                };
+                const widget = Array.from(document.querySelectorAll('altcha-widget')).find(isRendered);
                 if (!widget) return null;
 
                 const pickClickTarget = (root) => {
@@ -476,13 +505,14 @@ async function attemptAltchaClick(page, currentStatus = null) {
                 await dispatchCdpClick(page, clickX, clickY);
 
                 await page.evaluate(() => {
-                    const widget = document.querySelector('altcha-widget');
-                    if (widget && widget.shadowRoot) {
-                        const cb = widget.shadowRoot.querySelector('input[type="checkbox"]');
-                        if (cb && !cb.checked) {
-                            cb.click();
-                        }
-                    }
+                    const isRendered = (element) => {
+                        if (!element) return false;
+                        const rect = element.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0 && getComputedStyle(element).display !== 'none';
+                    };
+                    const widget = Array.from(document.querySelectorAll('altcha-widget')).find(isRendered);
+                    const cb = widget?.shadowRoot?.querySelector('input[type="checkbox"]');
+                    if (cb && !cb.checked) cb.click();
                 });
 
                 return true;
@@ -503,6 +533,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     const startedAt = Date.now();
     const totalWaitBudget = Math.max(waitAfterClick * maxAttempts, waitAfterClick);
     let clickAttempts = 0;
+    let missingChecks = 0;
     let lastStatusText = '';
 
     while (Date.now() - startedAt < totalWaitBudget) {
@@ -521,9 +552,15 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
         }
 
         if (!status.exists) {
-            await page.waitForTimeout(1000);
+            missingChecks += 1;
+            if (missingChecks >= 3) {
+                console.log(`[${stageName}] 未检测到可见 ALTCHA 控件；隐藏的 auto=onsubmit 控件将在提交时自动计算。`);
+                return true;
+            }
+            await page.waitForTimeout(500);
             continue;
         }
+        missingChecks = 0;
 
         if (status.isVerifying) {
             await page.waitForTimeout(1000);
@@ -578,7 +615,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
     }
 
     if (!sawAltcha) {
-        console.log(`[${stageName}] 弹窗中未检测到 ALTCHA 组件。`);
+        console.log(`[${stageName}] 未检测到可见 ALTCHA 控件；当前页面使用隐藏的 auto=onsubmit 模式，跳过预点击。`);
         return true;
     }
 
@@ -819,39 +856,30 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
-                        await page.waitForTimeout(1000);
-                    }
-
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
-                                    isTurnstileSuccess = true;
-                                    break;
-                                }
-                            } catch (e) { }
+                    // B/C. Renew 目前使用隐藏的 ALTCHA auto="onsubmit"，而不是 Turnstile。
+                    // 旧逻辑在这里固定轮询 30 秒，实际上页面里根本没有 Turnstile iframe。
+                    // 仅当 Renew 弹窗内确实出现可见 Cloudflare iframe 时才执行兼容处理。
+                    const renewTurnstile = modal.locator('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], iframe[title*="Cloudflare" i]').first();
+                    const hasRenewTurnstile = await renewTurnstile.isVisible({ timeout: 1000 }).catch(() => false);
+                    if (hasRenewTurnstile) {
+                        console.log('Renew 弹窗检测到 Turnstile，开始兼容处理...');
+                        let cdpClickResult = false;
+                        for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                            cdpClickResult = await attemptTurnstileCdp(page);
+                            if (cdpClickResult) break;
+                            await page.waitForTimeout(500);
                         }
+                        if (cdpClickResult) {
+                            console.log('   >> Renew Turnstile 点击已发送，等待验证结果...');
+                            await page.waitForTimeout(5000);
+                        } else {
+                            console.log('   >> Renew Turnstile 未能定位，继续由提交结果判断。');
+                        }
+                    } else {
+                        console.log('Renew 弹窗未包含 Turnstile，跳过无意义的 30 秒轮询。');
                     }
 
-                    // D. ALTCHA Captcha 处理 (本地版本关键功能)
+                    // D. ALTCHA 处理：可见控件才预点击；隐藏 auto=onsubmit 控件交给表单提交触发
                     const altchaOk = await solveAltchaIfPresent(page, "Renew弹窗", 15, 8000);
 
                     if (!altchaOk) {
@@ -882,13 +910,15 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         } catch (e) { }
 
                         // User Request: 找不到的话这个循环直接下一步点击renew，然后检测有没有Please complete the captcha to continue
-                        console.log('   >> 点击 Renew 确认按钮 (无论 Turnstile 状态如何)...');
+                        console.log('   >> 点击 Renew 确认按钮；隐藏 ALTCHA 将由 auto=onsubmit 自动开始 PoW 计算...');
                         await confirmBtn.click();
 
                         try {
                             // 1. Check for Errors (Captcha or Date limit)
                             const startVerifyTime = Date.now();
-                            while (Date.now() - startVerifyTime < 3000) {
+                            const verifyTimeout = 150000;
+                            let lastProgressText = '';
+                            while (Date.now() - startVerifyTime < verifyTimeout) {
                                 // A. Captcha Error
                                 if (await page.getByText('Please complete the captcha to continue').isVisible()) {
                                     console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
@@ -922,11 +952,38 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                                     } catch (e) { }
                                     break;
                                 }
-                                await page.waitForTimeout(200);
-                            }
-                        } catch (e) { }
 
-                        if (renewSuccess) break; // Break loop if not time yet
+                                // ALTCHA auto=onsubmit may keep the modal open while calculating.
+                                // Do not mistake that normal progress period for a failure.
+                                if (!await modal.isVisible().catch(() => false)) {
+                                    // Submission finished; leave this polling loop and let the
+                                    // existing success block capture a screenshot and notify.
+                                    break;
+                                }
+
+                                const progressText = await confirmBtn.evaluate((button) => {
+                                    const form = button.closest('form');
+                                    const widget = form?.querySelector('altcha-widget');
+                                    const state = widget?.state || widget?.getAttribute('state') || widget?.querySelector('.altcha')?.getAttribute('data-state') || 'unknown';
+                                    const valueLength = String(widget?.value || widget?.getAttribute('value') || form?.querySelector('input[name="altcha"], textarea[name="altcha"]')?.value || '').length;
+                                    return `button=${button.textContent.trim()}, disabled=${button.disabled}, state=${state}, valueLen=${valueLength}`;
+                                }).catch(() => '页面正在跳转');
+                                if (progressText !== lastProgressText) {
+                                    console.log(`   >> ALTCHA/提交状态: ${progressText}`);
+                                    lastProgressText = progressText;
+                                }
+
+                                await page.waitForTimeout(500);
+                            }
+
+                            if (!renewSuccess && !hasCaptchaError && Date.now() - startVerifyTime >= verifyTimeout) {
+                                console.log(`   >> ⚠️ 等待 ALTCHA/续期响应超过 ${Math.round(verifyTimeout / 1000)} 秒。`);
+                            }
+                        } catch (e) {
+                            console.log('   >> 等待续期结果时出错:', e.message);
+                        }
+
+                        if (renewSuccess) break; // 尚未到可续期时间，已作为正常跳过处理
 
                         if (hasCaptchaError) {
                             console.log('   >> Error found. Refreshing page to reset Turnstile...');
